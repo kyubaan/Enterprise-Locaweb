@@ -26,7 +26,7 @@ from reportlab.platypus import (
 )
 
 st.set_page_config(
-    page_title="AIOps Locaweb | Analytics",
+    page_title="Odin | Analytics",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -48,9 +48,10 @@ st.markdown(
             margin-bottom: 20px;
         }
 
+        /* Card adaptável a tema claro/escuro */
         div[data-testid="stMetric"] {
-            background-color: #f8fafc;
-            border: 1px solid #e8edf3;
+            background-color: rgba(127, 127, 127, 0.08);
+            border: 1px solid rgba(127, 127, 127, 0.25);
             padding: 14px;
             border-radius: 12px;
         }
@@ -71,11 +72,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
-# TÍTULO
-
 st.markdown(
-    '<div class="main-title">📊 AIOps Locaweb — Plataforma Analítico-Preditiva</div>',
+    '<div class="main-title">📊 Odin — Plataforma Analítico-Preditiva</div>',
     unsafe_allow_html=True,
 )
 
@@ -86,8 +84,6 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True,
 )
-
-# CONFIGURAÇÕES GERAIS
 
 REQUIRED_COLUMNS = [
     "data",
@@ -104,12 +100,11 @@ PRIORITY_WEIGHT = {
     "P4": 1,
 }
 
-# NORMALIZAÇÃO DOS DADOS
-
 def normalizar_dados(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
+    # Normalização dos nomes das colunas
     df.columns = (
         df.columns
         .astype(str)
@@ -118,6 +113,7 @@ def normalizar_dados(df: pd.DataFrame) -> pd.DataFrame:
         .str.replace(" ", "_", regex=False)
     )
 
+    # Verificação
     missing = [
         col
         for col in REQUIRED_COLUMNS
@@ -130,11 +126,13 @@ def normalizar_dados(df: pd.DataFrame) -> pd.DataFrame:
             + ", ".join(missing)
         )
 
+    # Data
     df["data"] = pd.to_datetime(
         df["data"],
         errors="coerce",
     )
 
+    # Textos
     df["produto"] = (
         df["produto"]
         .astype(str)
@@ -154,6 +152,7 @@ def normalizar_dados(df: pd.DataFrame) -> pd.DataFrame:
         .str.strip()
     )
 
+    # Quantidade
     df["quantidade"] = pd.to_numeric(
         df["quantidade"],
         errors="coerce",
@@ -165,6 +164,7 @@ def normalizar_dados(df: pd.DataFrame) -> pd.DataFrame:
         .clip(lower=0)
     )
 
+    # Remover registros inválidos
     df = df.dropna(
         subset=[
             "data",
@@ -174,6 +174,7 @@ def normalizar_dados(df: pd.DataFrame) -> pd.DataFrame:
         ]
     )
 
+    # Consolidar registros duplicados
     df = (
         df.groupby(
             [
@@ -188,8 +189,6 @@ def normalizar_dados(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return df
-
-# GERAÇÃO DE DADOS SIMULADOS
 
 @st.cache_data
 def gerar_dados_simulados(
@@ -248,6 +247,7 @@ def gerar_dados_simulados(
 
         dia = (data - datas[0]).days
 
+        # Sazonalidade semanal
         sazonalidade = (
             1
             + 0.10
@@ -262,6 +262,7 @@ def gerar_dados_simulados(
                     (produto, prioridade)
                 ]
 
+                # Tendência artificial no E-mail/P2
                 if (
                     produto == "E-mail Corporativo"
                     and prioridade == "P2"
@@ -298,135 +299,141 @@ def gerar_dados_simulados(
 
     return normalizar_dados(df)
 
-# PREVISÃO
 
-def prever_volume(
-    df: pd.DataFrame,
-    produto: str | None = None,
-    dias: int = 7,
-):
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+except ImportError:
+    RandomForestRegressor = None
 
+
+def _criar_serie_diaria(df, produto=None):
     dados = df.copy()
+    if produto and produto != "Todos":
+        dados = dados[dados["produto"] == produto]
+    return (dados.groupby("data")["quantidade"].sum()
+            .asfreq("D", fill_value=0).astype(float))
 
-    if (
-        produto
-        and produto != "Todos"
-    ):
-        dados = dados[
-            dados["produto"] == produto
-        ]
 
-    serie = (
-        dados.groupby("data")["quantidade"]
-        .sum()
-        .asfreq("D", fill_value=0)
-    )
+def _criar_atributos_temporais(serie):
+    base = pd.DataFrame({"y": serie.astype(float)})
+    for lag in [1, 2, 3, 7, 14]:
+        base[f"lag_{lag}"] = base["y"].shift(lag)
+    for janela in [3, 7, 14]:
+        base[f"media_{janela}"] = base["y"].shift(1).rolling(janela).mean()
+        base[f"std_{janela}"] = base["y"].shift(1).rolling(janela).std()
+    base["tendencia_7"] = base["media_3"] - base["media_7"]
+    idx = base.index
+    base["dia_semana"] = idx.dayofweek
+    base["fim_de_semana"] = (idx.dayofweek >= 5).astype(int)
+    base["dia_mes"] = idx.day
+    base["mes"] = idx.month
+    base["semana_ano"] = idx.isocalendar().week.astype(int)
+    base["sin_semana"] = np.sin(2 * np.pi * base["dia_semana"] / 7)
+    base["cos_semana"] = np.cos(2 * np.pi * base["dia_semana"] / 7)
+    base["sin_mes"] = np.sin(2 * np.pi * base["mes"] / 12)
+    base["cos_mes"] = np.cos(2 * np.pi * base["mes"] / 12)
+    return base
 
-    if len(serie) < 14:
-        raise ValueError(
-            "São necessários pelo menos "
-            "14 dias de histórico para gerar "
-            "uma previsão confiável."
-        )
 
-    janela = min(
-        21,
-        len(serie),
-    )
+def _colunas_modelo():
+    return ["lag_1", "lag_2", "lag_3", "lag_7", "lag_14",
+            "media_3", "media_7", "media_14", "std_3", "std_7", "std_14",
+            "tendencia_7", "dia_semana", "fim_de_semana", "dia_mes", "mes",
+            "semana_ano", "sin_semana", "cos_semana", "sin_mes", "cos_mes"]
 
-    valores = serie.iloc[-janela:].values
 
-    x = np.arange(
-        len(valores)
-    )
+def _prever_random_forest(serie, dias=7):
+    if RandomForestRegressor is None:
+        raise ImportError("scikit-learn não está instalado. Execute: pip install scikit-learn")
+    if len(serie) < 30:
+        raise ValueError("São necessários pelo menos 30 dias de histórico para o modelo de Machine Learning.")
 
-    slope, intercept = np.polyfit(
-        x,
-        valores,
-        1,
-    )
+    atributos = _criar_atributos_temporais(serie)
+    features = _colunas_modelo()
+    base = atributos.dropna().copy()
+    if len(base) < 20:
+        raise ValueError("Histórico insuficiente após a criação das variáveis preditivas.")
 
-    media_ponderada = (
-        pd.Series(valores)
-        .ewm(
-            span=7,
-            adjust=False,
-        )
-        .mean()
-        .iloc[-1]
-    )
+    teste_n = max(7, min(14, int(len(base) * 0.20)))
+    treino, teste = base.iloc[:-teste_n], base.iloc[-teste_n:]
 
+    modelo = RandomForestRegressor(n_estimators=400, max_depth=10, min_samples_leaf=2,
+                                   max_features="sqrt", random_state=42, n_jobs=-1)
+    modelo.fit(treino[features], treino["y"])
+    pred_teste = np.maximum(0, modelo.predict(teste[features]))
+
+    mae = float(mean_absolute_error(teste["y"], pred_teste))
+    rmse = float(np.sqrt(mean_squared_error(teste["y"], pred_teste)))
+    r2 = float(r2_score(teste["y"], pred_teste)) if len(teste) > 1 else float("nan")
+
+    # Modelo final usa todo o histórico disponível.
+    modelo_final = RandomForestRegressor(n_estimators=500, max_depth=12, min_samples_leaf=2,
+                                         max_features="sqrt", random_state=42, n_jobs=-1)
+    modelo_final.fit(base[features], base["y"])
+
+    serie_ext = serie.copy()
     previsoes = []
+    erro = max(rmse, float(serie.diff().dropna().std() or 1.0))
 
-    for i in range(
-        1,
-        dias + 1,
-    ):
-
-        tendencia = (
-            intercept
-            + slope
-            * (len(valores) + i - 1)
-        )
-
-        pred = (
-            media_ponderada * 0.40
-            + tendencia * 0.60
-        )
-
-        previsoes.append(
-            max(0, pred)
-        )
-
-    ajustado = (
-        intercept
-        + slope * x
-    )
-
-    residuos = (
-        valores - ajustado
-    )
-
-    desvio = float(
-        np.std(residuos)
-    )
-
-    futuro = pd.date_range(
-        start=serie.index.max()
-        + timedelta(days=1),
-        periods=dias,
-        freq="D",
-    )
-
-    previsoes_np = np.array(
-        previsoes
-    )
-
-    previsao_df = pd.DataFrame(
-        {
-            "data": futuro,
-
-            "previsao": previsoes_np,
-
-            "limite_inferior": np.maximum(
-                0,
-                previsoes_np
-                - 1.96 * desvio,
-            ),
-
-            "limite_superior":
-                previsoes_np
-                + 1.96 * desvio,
-        }
-    )
-
-    return (
-        serie,
-        previsao_df,
-    )
+    for _ in range(dias):
+        proxima = pd.Timestamp(serie_ext.index.max()) + pd.Timedelta(days=1)
 
 
-# RISCO DE OLA
+        serie_ext.loc[proxima] = np.nan
+        serie_ext = serie_ext.sort_index()
+
+        futuro_atributos = _criar_atributos_temporais(serie_ext)
+        linha = futuro_atributos.loc[[proxima], features]
+
+        # Segurança extra: se alguma feature não puder ser calculada
+        # por falta de histórico, interrompemos com uma mensagem clara.
+        if linha[features].isna().any().any():
+            raise ValueError(
+                "Não foi possível calcular todas as variáveis da previsão. "
+                "Utilize pelo menos 30 dias de histórico contínuo."
+            )
+
+        pred = max(0.0, float(modelo_final.predict(linha)[0]))
+        previsoes.append(pred)
+
+
+        serie_ext.loc[proxima] = pred
+
+    futuro = pd.date_range(serie.index.max() + timedelta(days=1), periods=dias, freq="D")
+    previsoes_np = np.array(previsoes)
+    margem = np.full(dias, 1.96 * erro)
+
+    previsao_df = pd.DataFrame({
+        "data": futuro,
+        "previsao": previsoes_np,
+        "limite_inferior": np.maximum(0, previsoes_np - margem),
+        "limite_superior": previsoes_np + margem,
+    })
+
+    media_7 = float(serie.tail(7).mean())
+    desvio_7 = float(serie.tail(7).std() or 1.0)
+    limiar_pico = max(media_7 * 1.20, media_7 + desvio_7)
+    previsao_df["risco_pico"] = ((previsao_df["previsao"] - limiar_pico) /
+                                  max(desvio_7, 1.0) * 50 + 50).clip(0, 99).round(1)
+    previsao_df["classificacao_risco"] = pd.cut(
+        previsao_df["risco_pico"], bins=[-1, 30, 60, 80, 100],
+        labels=["Baixo", "Moderado", "Alto", "Crítico"])
+
+    importancia = pd.DataFrame({"variavel": features,
+                                "importancia": modelo_final.feature_importances_}).sort_values(
+                                    "importancia", ascending=False)
+    metricas = {"MAE": mae, "RMSE": rmse, "R2": r2,
+                "amostras_treino": len(treino), "amostras_teste": len(teste),
+                "limiar_pico": limiar_pico}
+    return previsao_df, metricas, importancia
+
+
+def prever_volume(df, produto=None, dias=7):
+    serie = _criar_serie_diaria(df, produto)
+    previsao_df, metricas, importancia = _prever_random_forest(serie, dias)
+    return serie, previsao_df, metricas, importancia
+
 
 def calcular_risco_ola(
     df: pd.DataFrame,
@@ -434,12 +441,14 @@ def calcular_risco_ola(
 
     dados = df.copy()
 
+    # Peso da prioridade
     dados["peso_prioridade"] = (
         dados["prioridade"]
         .map(PRIORITY_WEIGHT)
         .fillna(1)
     )
 
+    # Volume ponderado
     dados["volume_ponderado"] = (
         dados["quantidade"]
         * dados["peso_prioridade"]
@@ -457,11 +466,13 @@ def calcular_risco_ola(
         - timedelta(days=13)
     )
 
+    # Últimos 7 dias
     recente = dados[
         dados["data"]
         >= inicio_recente
     ]
 
+    # 7 dias anteriores
     anterior = dados[
         (dados["data"]
          >= inicio_anterior)
@@ -496,6 +507,7 @@ def calcular_risco_ola(
         axis=1,
     ).fillna(0)
 
+    # Variação
     result["variacao"] = (
         (
             result["recente"]
@@ -520,6 +532,7 @@ def calcular_risco_ola(
         .fillna(0)
     )
 
+    # Média diária
     result["media_diaria"] = (
         result["recente"] / 7
     )
@@ -540,7 +553,7 @@ def calcular_risco_ola(
             index=result.index,
         )
 
-
+ 
     componente_tendencia = (
         (
             result["variacao"]
@@ -550,6 +563,7 @@ def calcular_risco_ola(
         / 150
         * 45
     )
+
 
     result["score"] = (
         componente_volume
@@ -564,6 +578,8 @@ def calcular_risco_ola(
         )
         .round(1)
     )
+
+
 
     result["classificacao"] = pd.cut(
         result["risco_ola"],
@@ -581,6 +597,7 @@ def calcular_risco_ola(
         include_lowest=True,
     )
 
+  
     result = result.reset_index()
 
     return result.sort_values(
@@ -588,7 +605,7 @@ def calcular_risco_ola(
         ascending=False,
     )
 
-# ALERTAS
+
 
 def gerar_alertas(
     df: pd.DataFrame,
@@ -600,6 +617,8 @@ def gerar_alertas(
     alertas = []
 
     data_max = df["data"].max()
+
+
 
     ultimos_7 = df[
         df["data"]
@@ -694,7 +713,6 @@ def gerar_alertas(
             }
         )
 
-    # Previsão
 
     if len(previsao_df) > 0:
 
@@ -727,7 +745,6 @@ def gerar_alertas(
                 }
             )
 
-    # Risco OLA
 
     for _, row in risco_df.head(3).iterrows():
 
@@ -745,7 +762,7 @@ def gerar_alertas(
                 }
             )
 
-    # Nenhum alerta
+
 
     if not alertas:
 
@@ -762,7 +779,6 @@ def gerar_alertas(
 
     return alertas
 
-# GRÁFICO HISTÓRICO + PREVISÃO
 
 def grafico_historico_previsao(
     df,
@@ -789,6 +805,7 @@ def grafico_historico_previsao(
 
     fig = go.Figure()
 
+    # Histórico
     fig.add_trace(
         go.Scatter(
             x=serie["data"],
@@ -801,6 +818,7 @@ def grafico_historico_previsao(
         )
     )
 
+    # Previsão
     fig.add_trace(
         go.Scatter(
             x=previsao_df["data"],
@@ -814,6 +832,7 @@ def grafico_historico_previsao(
         )
     )
 
+    # Intervalo
     fig.add_trace(
         go.Scatter(
             x=(
@@ -865,7 +884,6 @@ def grafico_historico_previsao(
 
     return fig
 
-# PARETO
 
 def grafico_pareto(df):
 
@@ -931,8 +949,6 @@ def grafico_pareto(df):
 
     return fig
 
-# PRIORIDADES
-
 def grafico_prioridades(df):
 
     dados = (
@@ -966,12 +982,13 @@ def grafico_prioridades(df):
     return fig
 
 
-# RISCO OLA
 
 def grafico_risco_ola(
     risco_df,
 ):
 
+    # IMPORTANTE:
+    # A coluna real é "equipe", não "Equipe".
     dados = (
         risco_df
         .sort_values(
@@ -1028,7 +1045,6 @@ def grafico_risco_ola(
 
     return fig
 
-# HEATMAP
 
 def grafico_heatmap(df):
 
@@ -1102,7 +1118,7 @@ def grafico_heatmap(df):
 
     return fig
 
-# GERAÇÃO DE GRÁFICOS PNG PARA PDF
+
 
 def gerar_grafico_png(
     funcao,
@@ -1135,7 +1151,6 @@ def gerar_grafico_png(
 
     return buffer
 
-# HISTÓRICO PARA PDF
 
 def chart_pdf_historico(
     df,
@@ -1201,7 +1216,7 @@ def chart_pdf_historico(
 
     ax.legend()
 
-# RISCO PARA PDF
+
 
 def chart_pdf_risco(
     risco_df,
@@ -1238,8 +1253,6 @@ def chart_pdf_risco(
         alpha=0.2,
     )
 
-
-# PRODUTOS PARA PDF
 
 def chart_pdf_pareto(
     df,
@@ -1280,7 +1293,6 @@ def chart_pdf_pareto(
     )
 
 
-# RELATÓRIO PDF
 
 def gerar_pdf(
     df,
@@ -1314,7 +1326,6 @@ def gerar_pdf(
 
     story = []
 
-    # CABEÇALHO
 
     story.append(
         Paragraph(
@@ -1341,7 +1352,7 @@ def gerar_pdf(
         )
     )
 
-
+  
     data_max = df["data"].max()
 
     total = int(
@@ -1468,7 +1479,6 @@ def gerar_pdf(
     )
 
 
- # GRÁFICO HISTÓRICO
 
     img = gerar_grafico_png(
         chart_pdf_historico,
@@ -1489,10 +1499,7 @@ def gerar_pdf(
         PageBreak()
     )
 
-
- # RISCO
-
-
+    
     img = gerar_grafico_png(
         chart_pdf_risco,
         risco_df,
@@ -1514,8 +1521,6 @@ def gerar_pdf(
     )
 
 
- # PARETO
-
     img = gerar_grafico_png(
         chart_pdf_pareto,
         df,
@@ -1533,8 +1538,6 @@ def gerar_pdf(
         PageBreak()
     )
 
-
-# ALERTAS
 
     story.append(
         Paragraph(
@@ -1568,7 +1571,6 @@ def gerar_pdf(
             )
         )
 
-    # RISCO POR EQUIPE
 
     story.append(
         Paragraph(
@@ -1656,7 +1658,7 @@ def gerar_pdf(
 
     return buffer_pdf.getvalue()
 
-# RELATÓRIO HTML
+
 
 def gerar_html_report(
     df,
@@ -1795,7 +1797,6 @@ def gerar_html_report(
     </html>
     """
 
-# SIDEBAR
 
 st.sidebar.header(
     "⚙️ Configuração"
@@ -1809,7 +1810,6 @@ modo_dados = st.sidebar.radio(
     ],
 )
 
-# CARREGAMENTO
 
 
 if modo_dados == "Upload CSV":
@@ -1859,7 +1859,6 @@ else:
     )
 
 
-# FILTROS
 
 st.sidebar.divider()
 
@@ -1929,7 +1928,6 @@ dias_historico = (
 )
 
 
-# APLICAÇÃO DOS FILTROS
 
 df = df_hist.copy()
 
@@ -1983,8 +1981,6 @@ if df.empty:
     st.stop()
 
 
-# PREVISÃO
-
 produto_previsao = (
     produto_foco
     if produto_foco != "Todos"
@@ -1993,12 +1989,15 @@ produto_previsao = (
 
 try:
 
-    serie_prev, previsao_df = (
-        prever_volume(
-            df,
-            produto=produto_previsao,
-            dias=7,
-        )
+    (
+        serie_prev,
+        previsao_df,
+        metricas_modelo,
+        importancia_modelo,
+    ) = prever_volume(
+        df,
+        produto=produto_previsao,
+        dias=7,
     )
 
 except ValueError as exc:
@@ -2009,7 +2008,6 @@ except ValueError as exc:
 
     st.stop()
 
-# RISCO
 
 risco_df = (
     calcular_risco_ola(
@@ -2017,7 +2015,6 @@ risco_df = (
     )
 )
 
-# ALERTAS
 
 alertas = (
     gerar_alertas(
@@ -2029,8 +2026,6 @@ alertas = (
     )
 )
 
-
-# KPIs
 
 ultima_data = (
     df["data"].max()
@@ -2086,7 +2081,27 @@ percentual_d1 = (
 )
 
 
-# CARDS
+st.subheader("🤖 Desempenho do modelo preditivo")
+mc1, mc2, mc3, mc4 = st.columns(4)
+with mc1:
+    st.metric("MAE", f"{metricas_modelo['MAE']:.2f}", help="Erro absoluto médio na validação temporal.")
+with mc2:
+    st.metric("RMSE", f"{metricas_modelo['RMSE']:.2f}", help="Penaliza erros maiores.")
+with mc3:
+    r2v = metricas_modelo["R2"]
+    st.metric("R²", "N/D" if np.isnan(r2v) else f"{r2v:.3f}", help="Desempenho no conjunto de teste temporal.")
+with mc4:
+    st.metric("Limiar de pico", f"{metricas_modelo['limiar_pico']:.1f}")
+
+with st.expander("🔬 Variáveis mais importantes"):
+    imp = importancia_modelo.copy()
+    imp["importancia"] = (imp["importancia"] * 100).round(2)
+    st.dataframe(imp.rename(columns={"variavel":"Variável", "importancia":"Importância (%)"}).head(10),
+                 use_container_width=True, hide_index=True)
+
+st.divider()
+
+
 
 c1, c2, c3, c4, c5 = (
     st.columns(5)
@@ -2132,7 +2147,6 @@ with c5:
     )
 
 
-# GRÁFICO PRINCIPAL
 
 st.subheader(
     "📈 Evolução e previsão"
@@ -2152,8 +2166,17 @@ st.plotly_chart(
     use_container_width=True,
 )
 
+st.subheader("🔮 Previsão diária de incidentes")
+tabela_previsao = previsao_df[["data", "previsao", "limite_inferior", "limite_superior",
+                              "risco_pico", "classificacao_risco"]].copy()
+tabela_previsao["data"] = tabela_previsao["data"].dt.strftime("%d/%m/%Y")
+tabela_previsao = tabela_previsao.rename(columns={
+    "data":"Data", "previsao":"Incidentes previstos", "limite_inferior":"Limite inferior",
+    "limite_superior":"Limite superior", "risco_pico":"Risco de pico (%)",
+    "classificacao_risco":"Risco"})
+st.dataframe(tabela_previsao.round(1), use_container_width=True, hide_index=True)
 
-# GRÁFICOS SECUNDÁRIOS
+
 
 col_a, col_b = (
     st.columns(2)
@@ -2194,7 +2217,6 @@ with col_b:
     )
 
 
-# HEATMAP
 
 st.subheader(
     "🗓️ Heatmap operacional"
@@ -2212,7 +2234,6 @@ st.plotly_chart(
 )
 
 
-# RISCO OLA
 
 st.subheader(
     "⚠️ Risco estimado de OLA"
@@ -2230,7 +2251,6 @@ st.plotly_chart(
 )
 
 
-# TABELA RISCO OLA
 
 tabela_risco = (
     risco_df[
@@ -2273,7 +2293,6 @@ st.dataframe(
 )
 
 
-# ALERTAS
 
 st.subheader(
     "🔔 Alertas acionáveis"
@@ -2315,7 +2334,6 @@ for alerta in alertas:
         )
 
 
-# DADOS TRATADOS
 
 with st.expander(
     "🔎 Ver dados tratados"
@@ -2331,7 +2349,6 @@ with st.expander(
     )
 
 
-# EXPORTAÇÕES
 
 st.subheader(
     "📥 Exportações"
@@ -2342,7 +2359,6 @@ col_d1, col_d2, col_d3 = (
 )
 
 
-# CSV
 
 csv_bytes = (
     df.to_csv(
@@ -2365,7 +2381,6 @@ with col_d1:
     )
 
 
-# HTML
 
 html_report = (
     gerar_html_report(
@@ -2391,7 +2406,6 @@ with col_d2:
     )
 
 
-# PDF
 
 with col_d3:
 
@@ -2430,7 +2444,6 @@ with col_d3:
         )
 
 
-# RODAPÉ
 
 st.divider()
 
